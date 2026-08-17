@@ -1,0 +1,176 @@
+WLWT Broadcast Automation — Project Glossary & Handoff Guide
+
+A complete reference for the WLWT Nowcast automation project: what each piece is, why it exists, why it's built the way it is, how to run and change it, and where it could go next. Written so someone new could pick this up and continue.
+
+1. The big picture
+
+This project began with one goal: automatically open the WLWT News 5 Nowcast and keep its livestream playing, unattended, on a Windows PC — without writing any custom JavaScript (a company policy constraint).
+
+It grew into three related tools that all share the same engine (Python driving a real Chrome browser via Playwright):
+
+Nowcast Player (wlwt_autoplay.py) — keeps our own Nowcast playing on a display, hands-free.
+Stream Watchdog (wlwt_watchdog.py) — checks whether a stream is up and alerts + shows a status dashboard if it goes down.
+Market Monitor (market_monitor.py) — a "who's on / what's on" board of competitor stations, with snapshot thumbnails, click-to-open, and breaking-news detection.
+
+The single most important insight of the whole project: the WLWT stream page does not truly autoplay — it requires a real click to start. Every early attempt tried to trick the player into auto-starting with browser launch flags, which only worked when several conditions happened to line up, so it was intermittent. The reliable fix was to actually perform the click (and confirm it worked). Everything good in this project flows from that realization.
+
+2. Why this architecture (Python + Playwright)
+
+Playwright is a browser-automation library: it launches and controls a real Chrome/Chromium browser from Python. We chose it because:
+
+The task fundamentally requires driving a real browser (loading the page, clicking play, confirming playback). Playwright does this reliably.
+It lets us click and check the page using native commands (find a button by its text/role, check if something is visible, click it) — so we never inject custom JavaScript, satisfying the policy. (Note: page.evaluate() would run custom JS — we deliberately never use it.)
+It's deterministic: a native click always lands, unlike a launch flag that merely hopes the site autoplays.
+
+Why not the alternatives we tried first:
+
+Browser launch flags + Task Scheduler (the --autoplay-policy approach): couldn't click, so it was intermittent. Abandoned. (Kept as a documented retrospective.)
+AutoHotkey (simulate a mouse click at screen coordinates): works, but more fragile (depends on the video being at a fixed screen position) and needs its own install. Kept as a documented "Option B."
+Python + Playwright became the primary solution ("Option A").
+3. Glossary of terms & technologies
+
+Playwright — Python library that launches and controls a real browser. The heart of all three tools.
+
+Chromium — the open-source browser Playwright downloads and drives (python -m playwright install chromium). It's the same engine as Chrome.
+
+Persistent context / user-data-dir — a dedicated browser profile folder (wlwt_profile/) the player reuses, so cookies/consent state persist and launch flags apply cleanly to a fresh process.
+
+Headless — running the browser with no visible window. The watchdog and market monitor run headless (they only need to check pages, not display them). The player runs headed (visible) because the whole point is to show the stream.
+
+Native locators — Playwright's built-in ways to find elements without custom JS: get_by_role("button", name=...), get_by_text(...), .is_visible(), etc. This is how we interact with pages while honoring the no-custom-JavaScript rule.
+
+Regex matchers (PLAY_RE, PAUSE_RE, CONSENT_RE) — case-insensitive text patterns used to find the right button (e.g. a "Play"/"Watch Live" control, a "Pause" control to confirm playback, or a cookie-consent "Accept" button). Tunable if a site changes its wording.
+
+Task Scheduler — the built-in Windows service that launches a program at a trigger (here: "at logon"). We use it to auto-start the tools hands-free.
+
+pythonw.exe vs python.exe — pythonw runs Python with no console window; python shows a console. We wanted pythonw for a clean hidden launch, but on the station's Python 3.14 build pythonw failed under Task Scheduler ("incorrect format", 0x8007000B), so we use python.exe and the script minimizes its own console instead.
+
+The Microsoft Store Python "alias" — on this PC, typing python resolves to ...\WindowsApps\python.exe, a stub that works interactively but fails when a scheduled task runs it (error 0x800710E0). The real interpreter is at C:\Users\<user>\AppData\Local\Python\pythoncore-3.14-64\python.exe. Always point scheduled tasks at the real path — get it via python -c "import sys; print(sys.executable)".
+
+MCP / connectors — not used in this project; ignore if seen elsewhere.
+
+4. Tool 1 — Nowcast Player (wlwt_autoplay.py)
+
+Purpose: keep our Nowcast playing on a display, unattended, auto-starting at logon.
+
+How it works (flow):
+
+Opens a persistent Chrome context to https://www.wlwt.com/nowcast.
+Dismisses any consent banner, brings the video into view, clicks play, then confirms it's playing (re-clicks if not).
+Loops: keeps the PC awake, watches for crashes, and refreshes on the hour (reloads the page and re-clicks play). Restarts the whole browser every 6h.
+
+Key config (top of file):
+
+REFRESH_ON_THE_HOUR = True — refresh at the top of each clock hour. If False, uses RELOAD_MINUTES (every N minutes from start).
+RELOAD_MINUTES = 60, CHECK_SECONDS = 20, RESTART_HOURS = 6, ZOOM = 0.6.
+PLAY_RE / PAUSE_RE / CONSENT_RE — button matchers.
+
+Key functions:
+
+keep_awake() — Windows API call so the PC/display won't sleep.
+minimize_console() — minimizes its own console window on start (for hand runs).
+dismiss_consent(page) — clicks a cookie/consent button if present.
+looks_playing(page) — heuristic: is a pause control showing / play control gone (i.e. it's playing)?
+click_to_play(page) — finds and clicks the play control.
+ensure_playing(page) — the core: check, and click if not playing.
+open_and_play(context) — open the page and get it playing.
+run_session(pw) — launch the browser with our flag set + pop-up handlers, then run the loop.
+main() — wraps run_session in crash-recovery (relaunch on error).
+
+Why the browser launch flags (in run_session):
+
+--autoplay-policy=no-user-gesture-required — reduces autoplay friction (we still click; this just helps).
+--force-device-scale-factor=0.6 — zooms out so the video is on-screen/centered.
+--disable-features=CalculateNativeWinOcclusion, --disable-backgrounding-occluded-windows, --disable-renderer-backgrounding — stop Chrome from throttling/pausing an unfocused window.
+--start-maximized, --hide-crash-restore-bubble — clean full-screen launch, no "didn't shut down correctly" bubble.
+--block-new-web-contents, --disable-notifications, --no-default-browser-check — pop-up / prompt suppression. Plus code handlers that auto-dismiss dialogs and auto-close any pop-up window that still appears.
+
+Companion file: setup-autostart.ps1 registers the scheduled task ("WLWT Nowcast Player") at logon, hunting for the real Python path and accepting an explicit -PythonwPath. Runs from an admin PowerShell.
+
+5. Tool 2 — Stream Watchdog (wlwt_watchdog.py)
+
+Purpose: know if a stream goes down, and show status on a dashboard + push alerts. (Built as a demonstration/extension; not necessarily deployed.)
+
+How it works: every ~2 min it loads the stream headless and decides UP/DOWN (page loads, video/player present, no error text). It debounces (needs 3 consecutive failures before declaring DOWN, so a blip won't cry wolf), alerts once on the change, sends a RECOVERED alert when it's back, serves a dashboard on port 8080, and writes a status file.
+
+Honest limit: this is a web-player health tripwire, not a frame-level broadcast probe. Good early warning on the web feed; not a replacement for purpose-built air-chain monitoring.
+
+6. Tool 3 — Market Monitor (market_monitor.py)
+
+Purpose: a networked "who's on / what's on" board of competitor stations, with snapshot thumbnails, click-to-open-live, and off-schedule "breaking" flags.
+
+Stations watched (all URLs confirmed): WLWT 5 (NBC), WCPO 9 (ABC), WKRC 12 (CBS), WXIX 19 (FOX), WSTR 64 (CW), WLKY (Louisville), WTHR (Indianapolis). WLKY and WTHR are out-of-market, kept for regional awareness.
+
+How it works (flow):
+
+Loops over STATIONS; for each, loads its live page headless and decides LIVE / OFF / UNKNOWN via is_live() (video/player present, or a "LIVE" indicator; UNKNOWN if the page won't load).
+capture_snapshot() saves a small JPEG thumbnail of each page into snapshots/ (served to the dashboard).
+within_schedule() checks the current day/time against that station's newscast times. If a station is LIVE outside its listed times, it's flagged BREAKING (possible breaking news) and can alert.
+write_status() writes market_status.json; a small web server (class H / serve()) serves the dashboard HTML, the status JSON, and the snapshot images on port 8090.
+
+Key config:
+
+STATIONS — dict of name -> {url, times}. times is a dict of weekday/saturday/sunday lists of "HH:MM" newscast starts. Empty list for a day-type = "just show LIVE/OFF, no breaking flag" (avoids false alarms when we don't know a schedule).
+CHECK_SECONDS = 90, NEWSCAST_MINS = 65 (how long after a start time still counts as "scheduled"), FAIL_TOLERANCE = 2 (consecutive live hits before flagging breaking), REALERT_MINUTES = 20.
+SERVER_PORT = 8090, SNAPSHOTS = True, SNAP_QUALITY = 45.
+EMAIL_ENABLED / WEBHOOK_ENABLED (+ SMTP or Teams/Slack webhook settings).
+
+The dashboard (served HTML, our own page so ordinary JS is fine here): green LIVE / red BREAKING / gray OFF / dark UNKNOWN tiles, snapshot thumbnails, click-to-open on live tiles, a recent-activity log, a "monitor offline / stale" banner, a "Reload now" button, and a 90-second auto-refresh.
+
+Alerts: alert() sends via SMTP email and/or a Teams/Slack incoming webhook (both stdlib, no extra installs). Fires on off-schedule (breaking) live.
+
+7. Hard-won lessons (read before changing anything)
+The site needs a real click. Don't try to make it autoplay with flags — click and confirm.
+Use the real python.exe, not the Store alias, for scheduled tasks. Get it with python -c "import sys; print(sys.executable)".
+On this Python build, use python.exe (not pythonw.exe) in the task, or it fails to launch. The script minimizes its own console instead.
+Register scheduled tasks from an ADMIN PowerShell (non-admin = access denied).
+One folder, one task, one process. Duplicate copies/folders and leftover running processes caused "multiple windows." Kill strays with the Get-CimInstance ... Stop-Process one-liner; keep a single clean folder.
+Watch out for smart quotes / dashes when pasting PowerShell — retype them. Run one command per line.
+The dashboard is served, not a local file. A syntax error in its embedded JavaScript makes the whole page silently fail ("stuck on loading"). Validate any dashboard JS change. (A doubled-quote bug from string-escaping did exactly this once.)
+Verify the file actually updated after a download — check content (Select-String -Pattern "...") not just the byte size, and confirm no old process is holding the port.
+8. How to run each tool (quick reference)
+
+Player: put wlwt_autoplay.py + setup-autostart.ps1 in one folder; install Python 3.11+ and Playwright; register at logon (admin) with the real python.exe path; Start-ScheduledTask -TaskName "WLWT Nowcast Player". See the player README for full steps.
+
+Watchdog / Market Monitor: put the .py in a folder; edit the config block (URLs, schedules, alert settings); python market_monitor.py; open http://localhost:8090/ (monitor) or :8080/ (watchdog). For other desks, IT allows inbound TCP on that port. Stop with Ctrl+C.
+
+Common controls:
+
+Stop a task:    Stop-ScheduledTask  -TaskName "<name>"
+Start a task:   Start-ScheduledTask -TaskName "<name>"
+Kill strays:    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+                Where-Object { $_.CommandLine -like "*<script>.py*" } |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Get real python: python -c "import sys; print(sys.executable)"
+9. What could be added next
+
+Player: package as a background service; a small local status page; a config file instead of in-file constants.
+
+Market Monitor:
+
+Turn on alerts (email/Teams) — code exists, just needs credentials.
+Auto-start at logon (a setup-autostart.ps1 like the player's).
+True live video on click — launch the click-to-play player on a station URL for full-screen live video (a real multiviewer), instead of just opening the station's page.
+Kiosk/wall layout — a stripped-down full-screen mode for a monitoring wall.
+History/trends — daily log of who was live when, weekly recap.
+Pin/sort — pin WLWT first, or sort LIVE tiles to the top.
+Better "live" detection per site — each station's page differs; detection may need per-site tuning if a site is revamped.
+
+Watchdog:
+
+Heartbeat — periodic "all green" ping so silence itself becomes an alarm.
+Merge with the market monitor into one unified board (own-stream health + competitor status).
+
+Cross-cutting: move shared code (browser launch, is-live checks, the web server, alerting) into a small common module so the three tools stop duplicating it.
+
+10. File inventory (deliverables)
+wlwt_autoplay.py — the Nowcast player (+ setup-autostart.ps1, README).
+wlwt_watchdog.py — the stream watchdog (+ README).
+market_monitor.py — the market monitor (+ README).
+PDFs: project summary, click-to-play notes, flag-approach retrospective, Python-specific reference.
+WLWT-Nowcast-Pitch.pptx — the pitch deck for engineers/IT.
+(Superseded, kept for reference): AutoHotkey .ahk, PowerShell/flag bundles, the browser-extension version.
+
+Environment: Windows PC; Python 3.11+ (this machine: 3.14 at C:\Users\<user>\AppData\Local\Python\pythoncore-3.14-64\); Playwright + Chromium. Dashboards need inbound TCP on their port for cross-network viewing.
+
+Standing reminder: confirm WLWT's (and each station's) terms of use permit automated/unattended playback and checking.
